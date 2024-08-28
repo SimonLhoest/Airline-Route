@@ -1,0 +1,248 @@
+---
+title: Fleet assignment
+author: OZBAY Yasin - LHOEST Simon
+date: Group 07
+output:
+  html_document:
+    theme: paper
+    highlight: monochrome
+    toc: true
+    toc_float: true
+---
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 14px;
+  }
+</style>
+  
+```{r setup, include=FALSE}
+source("mp_solver.R")
+schedule <- fread("schedule.csv")
+flight_info <- fread("flight_info.csv")
+fleet_info <- fread("fleet_info.csv")
+
+knitr::opts_chunk$set(echo = F, warning = F)
+```
+
+```{r code, include=FALSE}
+lp_code <- "
+set F;
+set K;
+set C;
+set M;
+
+param prev{k in M};
+param c{i in F, j in K};
+param N{j in K};
+param s{i in F, k in M}, default 0;
+
+var x{i in F, j in K}, binary;
+var G{k in M, j in K} >= 0, integer;
+
+s.t. Summ{i in F}: sum{j in K}x[i,j], == 1;
+s.t. Ground{k in M, j in K}: G[prev[k],j] + sum{i in F}(s[i,k]*x[i,j]), == G[k,j];
+s.t. Number{j in K}: sum{k in C}G[k,j], <= N[j];
+
+minimize obj: sum{j in K, i in F}c[i,j]*x[i,j];
+"
+
+fleet_info[, Fleet := tstrsplit(Fleet, " ")[2]]
+
+Nflight = nrow(flight_info)
+Nfleet = nrow(fleet_info)
+Nplane = fleet_info[,sum(Size)]
+
+sch = merge(schedule, flight_info, by=c("Flight no.", "Origin", "Destination"),
+              sort = FALSE, all = TRUE)
+
+set_F = data.table(schedule[,`Flight no.`])
+
+set_K = data.table(fleet_info$Fleet)
+
+set_M = data.table(id = c(1:(Nflight*2))) 
+
+temp1 = fleet_info[rep(1:.N, each=Nflight)]
+temp2 = flight_info[rep(1:.N, Nfleet)]
+final = cbind(temp2,temp1)
+final[,OC := CASK*Seats*`Distance (km)`]
+thefunc <- function(x, c, mean_val, sd_val)  {(x-c)*dnorm(x, mean = mean_val, sd = sd_val)}
+final[, ES := integrate(function(x) (x-Seats)*dnorm(x, mean = `Demand (mean)`, sd = `Demand (sd)`), lower = Seats, upper = Inf)$value, .(`Flight no.`, Fleet)]
+final[,SC := ES*RASK*`Distance (km)`*0.85]
+param_c =data.table(final[,`Flight no.`],final[,Fleet],cost=final[, OC+SC])
+
+param_N = data.table(fleet_info[,Fleet],fleet_info[,Size])
+
+sch1 = copy(sch)
+sch2 = copy(sch)
+sch1 = sch1[,airprt:=sch[,Destination] ]
+sch2 = sch2[,airprt:=sch[,Origin] ]
+sch1 = sch1[,time:=sch$Arrival ]
+sch2 = sch2[,time:=sch$Departure]
+sch1 = sch1[,S:= 1 ]
+sch2 = sch2[,S:= -1]
+
+sch3 <- rbind(sch1,sch2)
+
+sch3 <- sch3[order(sch3$airprt,sch3$time),]
+param_s = data.table(sch3$`Flight no.`, sch3$airprt, sch3$S,c(1:(Nflight*2)))
+setnames(param_s, c("V1","V2","V3","V4"),c("Flight", "Node","S", "id_node"))
+param_s[,prev := shift(id_node,1),by=Node]
+order=is.na(param_s$prev)
+param_s[is.na(param_s$prev), prev:=param_s[, id_node[.N], Node]$V1]
+
+param_prev = param_s[, .(id_node, prev)]
+order=param_s[order,prev]
+temp=data.table(Node=param_s[order,id_node],Overnight=param_s[order,S])
+set_C = data.table(Node=temp[Overnight==1,Node])
+
+
+param_s[,Node:=id_node] #Cleaning
+param_s[,id_node:=NULL] 
+param_s[,prev:=NULL]
+
+vars <- list(set.F  = set_F,
+            set.K   = set_K,
+            set.C   = set_C,
+            set.M   = set_M,
+            par.prev= param_prev,
+            par.c   = param_c,
+            par.N   = param_N,
+            par.s   = param_s,
+            lp.code = lp_code)
+
+example <- lp_solver(vars, T)
+x=example$vars[var=="x"]
+G=example$vars[var=="G"]
+
+beurk = G[i1 %in% set_C$Node,]
+setnames(beurk,c("i1","i2"),c("Node","Fleet"))
+beurk[,Node:=as.integer(Node)]
+beurk=merge(beurk,param_s,by="Node")
+setnames(beurk,"Flight","Flight no.")
+beurk=merge(beurk,schedule,by="Flight no.")
+beurk=beurk[,.(Fleet,value,Destination)]
+
+beurk[,value:=as.character(value)]
+beurk[value=="1",value:="1 aircraft"]
+beurk[value>"1 aircraft", value:=paste(value, 'aircrafts')]
+
+beurk = dcast(beurk, Destination~Fleet,value.var="value")
+beurk[is.na(beurk)]="-"
+
+sol1 = beurk
+sol2 = schedule[x$i2==fleet_info[1,Fleet]]
+sol2$"Flight time" <- round(as.numeric(as.ITime(sol2$"Flight time")/3600), digits=1)
+sol22= schedule[x$i2==fleet_info[2,Fleet]]
+sol22$"Flight time" <- round(as.numeric(as.ITime(sol22$"Flight time")/3600), digits=1)
+
+setnames(x,c("i1","i2"),c("Flight no.","Fleet"))
+x[Fleet==fleet_info[1,Fleet],Fleet:=1]
+x[Fleet==fleet_info[2,Fleet],Fleet:=2]
+# fwrite(x[,.(`Flight no.`,Fleet)],file = "07_YVR_feel_dist.csv")
+```
+```{r code2, include=FALSE}
+lp_code2 <- "
+set F;
+set K;
+set C;
+set M;
+
+param prev{k in M};
+param c{i in F, j in K};
+param N{j in K};
+param s{i in F, k in M}, default 0;
+
+var x{i in F, j in K}, binary;
+var G{k in M, j in K} >= 0, integer;
+
+s.t. Summ{i in F}: sum{j in K}x[i,j], == 1;
+s.t. Ground{k in M, j in K}: G[prev[k],j] + sum{i in F}s[i,k]*x[i,j], == G[k,j];
+s.t. Number{j in K}: sum{k in C}G[k,j], <= N[j];
+
+minimize obj: sum{k in C, j in K}G[k,j];
+"
+vars <- list(set.F  = set_F,
+            set.K   = set_K,
+            set.C   = set_C,
+            set.M   = set_M,
+            par.prev= param_prev,
+            par.c   = param_c,
+            par.N   = param_N,
+            par.s   = param_s,
+            lp.code = lp_code2)
+example2 <- lp_solver(vars, T)
+MOINS = Nplane-example2$optim
+```
+```{r code3, include=FALSE}
+last <- data.table(AC1 = 0:sum(Nplane), AC2 = sum(Nplane):0)
+last[,id:=1:nrow(last)]
+
+notafor <- function(number) {
+  param_N <- data.table(fleet_info[,Fleet],number)
+  vars <- list(set.F  = set_F,
+            set.K   = set_K,
+            set.C   = set_C,
+            set.M   = set_M,
+            par.prev= param_prev,
+            par.c   = param_c,
+            par.N   = param_N,
+            par.s   = param_s,
+            lp.code = lp_code)
+  example <- lp_solver(vars, T) 
+  return(round(example$optim))
+}
+
+last[, cost := notafor(c(AC1,AC2)),by=id]
+last[, id := NULL]
+min = which(last[,3]==min(last[, 3]))[1]
+```
+
+<!-- Your report here -- NO LOOPS -->
+
+# Solution
+
+The minimum cost is **`r format(round(unlist(example$optim)), scientific=F)`€**. In this case, the fleet distribution is: 
+
+```{r sol1, echo = F}
+kable(sol1, caption = "Fleet distribution", align = rep("c", ncol(sol1)), col.names = c("Airport",paste(fleet_info[,Fleet]," fleet"))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE) 
+```
+
+The schedules for fleets `r unlist(fleet_info[1,Fleet])` and `r unlist(fleet_info[2,Fleet])` are: 
+
+```{r sol2, echo = F}
+kable(sol2, caption = paste(unlist(fleet_info[1,Fleet]),"schedule"), align = rep("c", ncol(sol2)), col.names = c("Flight no.", "Origin", "Departure time", "Destination", "Arrival time", "Flight time")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE)
+
+kable(sol22, caption = paste(unlist(fleet_info[2,Fleet]),"schedule"), align = rep("c", ncol(sol22)), col.names = c("Flight no.", "Origin", "Departure time", "Destination", "Arrival time", "Flight time")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE)
+``` 
+
+# Scenario analysis
+
+## Case 1
+
+> Minimum number of aircrafts to cover all flights
+
+The minimum number of aircrafts is **`r example2$optim`**, `r MOINS` less than our current fleet.
+
+## Case 2
+
+> Minimum number of aircrafts to cover all flights
+
+The best combination with our fleet size is formed by `r unlist(last[min,1])` `r unlist(fleet_info[1,Fleet])` and `r unlist(last[min,2])` `r unlist(fleet_info[2,Fleet])` with a minimum cost of `r format(round(unlist(last[min,3])),scientific=F)`€. All possible combinations for our fleet size are:
+
+```{r last, echo = F}
+kable(last, align = rep("c", ncol(last)), col.names = c(paste(fleet_info[,Fleet]," aircrafts"), "Total daily cost (€)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE) %>%
+  row_spec(min, bold = T, background = "#FFFDE9")
+``` 
+
+
+
+<div class = "tocify-extend-page" data-unique = "tocify-extend-page" style = "height: 0;"></div>
